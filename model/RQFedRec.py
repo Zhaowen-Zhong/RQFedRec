@@ -45,17 +45,32 @@ class RQFedRec(BasicModel):
 
     def teacher_loss(self, users, items, label):
         users_emb = self.embedding_user(users)
+        
+        # 修复：注入双通道邻居偏置，让推荐预测真正用上邻居信息
+        # 注意：这里假设当前客户端 i 的本地用户 ID 是统一映射的（例如 0）
+        # 如果每个客户端本地只有一个用户，u_id 通常就是 0
+        if len(self.neighbor_bias) > 0:
+            u_id = users[0].item() # 取当前 batch 的第一个用户 ID
+            if u_id in self.neighbor_bias:
+                users_emb = users_emb + self.neighbor_bias[u_id]
+
         items_emb = self.embedding_item(items)
         scores = self.f(torch.sum(torch.mul(users_emb, items_emb), dim=1))
         return self.BCEloss(scores, label)
-
+    
     def student_loss(self, users, items, label):
         student_items_emb = self.get_item_emb(items)
         teacher_items_emb = self.embedding_item(items)
         return self.MSEloss(teacher_items_emb.detach(), student_items_emb)
 
+
     def getUsersRating(self, users, items):
         users_emb = self.embedding_user(torch.tensor([users]).to(self.device))
+        
+        # 修复：评估时同样注入双通道邻居偏置
+        if len(self.neighbor_bias) > 0 and users in self.neighbor_bias:
+            users_emb = users_emb + self.neighbor_bias[users]
+
         teacher_items_emb = self.embedding_item(items.to(self.device))
         return self.f(torch.matmul(users_emb, teacher_items_emb.t()))
 
