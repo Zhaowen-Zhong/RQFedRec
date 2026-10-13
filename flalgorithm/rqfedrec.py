@@ -158,7 +158,7 @@ class RQFedRec(object):
         for i in range(self.client_num):
             private_state = {k: self.server_model.state_dict()[k] for k in self.download_paramname}
             self.client_model[i].load_state_dict(private_state, strict=False)
-
+            
     # 客户端本地训练，融合元学习
     def train_client_model(self):
         for i in range(self.client_num):
@@ -172,9 +172,32 @@ class RQFedRec(object):
                     self.dataset_list[i].UniformSample()
                     for batch_users, batch_items, batch_ratings in self.loader_list[i]:
                         batch_users, batch_items, batch_ratings = batch_users.to(self.device), batch_items.to(self.device), batch_ratings.to(self.device)
+                        
+                        # === 基础推荐损失 ===
                         loss = self.client_model[i].teacher_loss(batch_users, batch_items, batch_ratings)
+                        
+                        # === FedCodeFair组件：公平正则 (表示层) ===
+                        # 获取当前 batch 的离散码序列，计算码分布的熵
+                        batch_sid = self.client_model[i].sid[batch_items]
+                        fair_loss = self.client_model[i].fairness_regularization(batch_sid)
+                        
+                        # === FedCodeFair组件：对比学习 ===
+                        # 视图1：原始用户嵌入
+                        view1_user_emb = self.client_model[i].embedding_user(batch_users)
+                        # 视图2：用户嵌入 + 双通道邻居偏置（如果存在）
+                        if i in self.client_model[i].neighbor_bias:
+                            bias = self.client_model[i].neighbor_bias[i]
+                            view2_user_emb = view1_user_emb + bias
+                        else:
+                            view2_user_emb = view1_user_emb
+                        cl_loss = self.client_model[i].contrastive_loss(view1_user_emb, view2_user_emb)
+                        
+                        # === 组合损失并更新 Teacher ===
+                        # 权重 (0.1, 0.01) 是经验值，后期需要根据实验效果调参
+                        total_loss = loss + 0.1 * fair_loss + 0.01 * cl_loss
+                        
                         self.teacher_optimizer[i].zero_grad()
-                        loss.backward()
+                        total_loss.backward()
                         self.teacher_optimizer[i].step()
 
                 # 2. student模型训练
@@ -187,24 +210,28 @@ class RQFedRec(object):
                         loss.backward()
                         self.student_optimizer[i].step()
                 
-                # FedCodeFair组件调用
-                # 1. 对比学习（需要从 loader 里准备两个视图，这里先用伪代码占位）
-                # cl_loss = self.client_model[i].contrastive_loss(view1_user_emb, view2_user_emb)
-                
-                # 2. 公平正则（从当前 batch 取 sid 计算）
-                # fair_loss = self.client_model[i].fairness_regularization(batch_sid)
-                
-                # 3. 元学习内循环（骨架）
-                # meta_loss = self.client_model[i].meta_adapt(support_data, query_data, steps=self.meta_steps, lr=self.meta_lr)
-                
-                # 4. 组合额外损失并反向传播更新 Student（注意权重调节，比如 0.1 和 0.01）
-                # extra_loss = cl_loss + 0.1 * fair_loss + 0.01 * meta_loss
-                # self.student_optimizer[i].zero_grad()
-                # extra_loss.backward()
-                # self.student_optimizer[i].step()
+                # === FedCodeFair组件：元学习内循环 ===
+                # 将当前 batch 切分为支持集和查询集
+                # 使用最后一次迭代的 batch 数据进行元学习
+                if len(batch_users) > 1:  # 确保有足够的数据进行切分
+                    half = len(batch_users) // 2
+                    support_data = (batch_users[:half], batch_items[:half], batch_ratings[:half])
+                    query_data = (batch_users[half:], batch_items[half:], batch_ratings[half:])
+                    
+                    # 调用模型内部的元学习适应函数
+                    meta_loss = self.client_model[i].meta_adapt(
+                        support_data, query_data, 
+                        steps=self.meta_steps, 
+                        lr=self.meta_lr
+                    )
+                    
+                    # 反向传播元损失，更新模型参数（包括全局码本）
+                    self.student_optimizer[i].zero_grad()
+                    meta_loss.backward()
+                    self.student_optimizer[i].step()
             
             self.client_model[i] = self.client_model[i].to('cpu')
-
+    
     # 客户端上传，融合码序列和鲁棒聚合
     def client_upload(self):
         self.client_sids = [] 
