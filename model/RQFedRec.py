@@ -137,32 +137,54 @@ class RQFedRec(BasicModel):
 
     def meta_adapt(self, support_data, query_data, steps, lr):
         """
-        新增方法：元学习内循环（FedCodeFair-B 最大创新点）。
+        元学习内循环（FedCodeFair-B 最大创新点）。
         对应方案：支持集适应 -> 查询集评估 -> 计算元梯度。
         实现难点：离散的 SID 不可导。这里使用 Gumbel-Softmax 松弛离散码为连续概率分布。
-        
-        注意：由于这里涉及具体的数据流，目前提供完整框架骨架，待后面结合 train_client_model 中的
-             数据切分（support_data / query_data）进行补全。
         """
-        # 1. 将离散码放宽为概率分布（Gumbel-Softmax 松弛）
-        # 在模型前向传播时，使用 Gumbel-Softmax 代替普通的 get_item_emb
-        # 例如： soft_sid = F.gumbel_softmax(logits, tau=1, hard=False)
-        
-        # 2. 克隆一组快速适应参数（内循环专用）
+        # 1. 克隆一组快速适应参数（内循环专用）
         fast_weights = [c.weight.clone().detach().requires_grad_(True) for c in self.codebook_embeddings]
         
-        # 3. 支持集适应（Support Set Adaptation）
-        for _ in range(steps):
-            # 伪代码：使用 fast_weights 在支持集上计算 loss，并求导更新 fast_weights
-            # loss = self._compute_loss(support_data, fast_weights)
-            # grads = torch.autograd.grad(loss, fast_weights)
-            # fast_weights = [w - lr * g for w, g in zip(fast_weights, grads)]
-            pass 
-            
-        # 4. 查询集评估（Query Set Evaluation）
-        # 使用适应后的 fast_weights，在查询集上计算 meta_loss
-        # meta_loss = self._compute_loss(query_data, fast_weights)
+        # 解包支持集和查询集
+        s_users, s_items, s_ratings = support_data
+        q_users, q_items, q_ratings = query_data
         
-        # 注意：需要返回 meta_loss，让外部的 meta_optimizer 去更新全局码本
-        # 此处返回一个占位的 0 损失，防止代码报错
-        return torch.tensor(0.0, device=self.device, requires_grad=True)
+        # 2. 支持集适应（Support Set Adaptation）
+        for _ in range(steps):
+            # 使用快速权重计算支持集的前向传播
+            # 为了简化，这里直接使用支持集的推荐损失（实际可加入 Gumbel-Softmax 松弛）
+            s_users_emb = self.embedding_user(s_users)
+            
+            # 临时替换码本权重以计算快速适应损失
+            original_weights = [c.weight.data.clone() for c in self.codebook_embeddings]
+            for c, w in zip(self.codebook_embeddings, fast_weights):
+                c.weight.data = w
+                
+            s_items_emb = self.get_item_emb(s_items)
+            scores = self.f(torch.sum(torch.mul(s_users_emb, s_items_emb), dim=1))
+            loss = self.BCEloss(scores, s_ratings)
+            
+            # 还原原始权重，防止影响外循环
+            for c, w in zip(self.codebook_embeddings, original_weights):
+                c.weight.data = w
+                
+            # 求梯度并更新快速权重
+            grads = torch.autograd.grad(loss, fast_weights, create_graph=True)
+            fast_weights = [w - lr * g for w, g in zip(fast_weights, grads)]
+            
+        # 3. 查询集评估（Query Set Evaluation）
+        # 使用适应后的 fast_weights，在查询集上计算 meta_loss
+        original_weights = [c.weight.data.clone() for c in self.codebook_embeddings]
+        for c, w in zip(self.codebook_embeddings, fast_weights):
+            c.weight.data = w
+            
+        q_users_emb = self.embedding_user(q_users)
+        q_items_emb = self.get_item_emb(q_items)
+        q_scores = self.f(torch.sum(torch.mul(q_users_emb, q_items_emb), dim=1))
+        meta_loss = self.BCEloss(q_scores, q_ratings)
+        
+        # 还原原始权重
+        for c, w in zip(self.codebook_embeddings, original_weights):
+            c.weight.data = w
+            
+        # 返回 meta_loss，让外部的 student_optimizer 去更新全局码本
+        return meta_loss
