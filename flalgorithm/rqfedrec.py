@@ -128,7 +128,23 @@ class RQFedRec(object):
         self.client_sids = [] # 存储客户端上传的码序列         
         self.semantic_neighbors = [] # 码共现图构建的语义邻居  
         self.behavior_neighbors = [] # F2PGNN行为邻居预留  
-        self.H_u_list = [self.sid_length] * self.client_num # 预留：每个用户的隐私上传参数
+        
+        # 修改说明：H_u 隐私异质性，用于模拟不同用户的隐私偏好。
+        # 高隐私用户只上传前1级，低隐私用户上传全部H级。
+        # 体现“码级隐私控制”，让用户自主决定上传几级码序列。
+        import random
+        random.seed(42) # 固定随机种子，保证实验可复现
+        self.H_u_list = []
+        for _ in range(self.client_num):
+            # 假设 40% 高隐私用户（传1级），30% 中隐私（传2级），30% 低隐私（传全H级）
+            r = random.random()
+            if r < 0.4:
+                self.H_u_list.append(1)
+            elif r < 0.7:
+                self.H_u_list.append(min(2, self.sid_length))
+            else:
+                self.H_u_list.append(self.sid_length)
+        self.logger.info(f"隐私异质性初始化完毕。H_u分布: {self.H_u_list.count(1)}个用户传1级, {self.H_u_list.count(2)}个用户传2级, {self.H_u_list.count(self.sid_length)}个用户传全级。")
         
     
     def build_global_config(self, config):
@@ -184,32 +200,55 @@ class RQFedRec(object):
             
             self.client_model[i] = self.client_model[i].to('cpu')
 
-    # 客户端上传，融合码序列和鲁棒聚合
-    def client_upload(self):
-        self.client_sids = [] #每次重新收集
-        datasize_sum = 0
-        aggstate = {k: 0.0 for k in self.server_paramname}
+        # 客户端上传，融合码序列和鲁棒聚合
+        def client_upload(self):
+        self.client_sids = [] 
+        
+        # 1. 收集所有客户端的参数和码序列
+        # 格式：{参数名: [张量1, 张量2, ...], ...}
+        collected_params = {k: [] for k in self.server_paramname}
         
         for i in range(self.client_num):
-            datasize = self.dataset_list[i].__len__()
-            datasize_sum += datasize
             self.client_model[i] = self.client_model[i].to(self.device)
             
-            # 新增：收集码序列，并应用H_u隐私级数截断
+            # 收集码序列，并应用 H_u 隐私级数截断
             local_sid = self.client_model[i].sid.detach().cpu().numpy()
             H_u = self.H_u_list[i]
             truncated_sid = local_sid[:, :H_u] 
             self.client_sids.append(truncated_sid)
             
-            # 原有聚合逻辑，在此处可以将加权平均替换为Trimmed-Mean
+            # 收集参数
+            state_dict = self.client_model[i].state_dict()
             for k in self.server_paramname:
-                aggstate[k] = aggstate[k] + self.client_model[i].state_dict()[k] * datasize
+                collected_params[k].append(state_dict[k].cpu()) # 放在 CPU 上排序，节省显存
+                
             self.client_model[i] = self.client_model[i].to("cpu")
 
+        # 2. 执行 Trimmed-Mean 聚合
+        aggstate = {}
         for k in self.server_paramname:
-            aggstate[k] = aggstate[k] / datasize_sum
-            # 如果要在此处实现Trimmed-Mean，需在此处先收集所有客户端的张量，排序后去掉极值再平均
+            # 堆叠所有客户端的该参数，形状：(client_num, *param_shape)
+            stacked = torch.stack(collected_params[k], dim=0) 
+            
+            # 在 client_num 维度上进行排序
+            sorted_tensors, _ = torch.sort(stacked, dim=0)
+            
+            # 计算需要裁剪的数量
+            n = len(collected_params[k])
+            trim_count = int(n * self.trim_ratio)
+            
+            # 裁剪最大和最小的部分
+            if trim_count > 0:
+                trimmed = sorted_tensors[trim_count : n - trim_count]
+            else:
+                trimmed = sorted_tensors
+                
+            # 对剩余部分求平均
+            aggstate[k] = trimmed.mean(dim=0).to(self.device)
+
+        # 3. 将聚合后的参数加载回服务端模型
         self.server_model.load_state_dict(aggstate, strict=False)
+        self.logger.info(f"Trimmed-Mean 聚合完成，裁剪比例: {self.trim_ratio}")
 
     # 新增码共现图
     def build_code_cooccurrence_graph(self):
@@ -240,7 +279,11 @@ class RQFedRec(object):
                             neighbor_counter[other_u] = 0
                         neighbor_counter[other_u] += 1
             
-            neighbors = [uid for uid, count in neighbor_counter.items() if count >= self.sem_threshold]
+            # 修改说明：自适应阈值，就是根据用户自己的 H_u 动态调整阈值，防止高隐私用户被完全孤立。
+            # 解决 H_u 差异导致的图构建盲区。
+            u_actual_threshold = min(self.sem_threshold, self.H_u_list[u_idx])
+            neighbors = [uid for uid, count in neighbor_counter.items() if count >= u_actual_threshold]
+            
             self.semantic_neighbors.append(neighbors)
             
         self.logger.info(f"Graph built. Avg semantic neighbors: {np.mean([len(n) for n in self.semantic_neighbors]):.2f}")
