@@ -213,7 +213,7 @@ class RQFedRec(object):
                 # === FedCodeFair组件：元学习内循环 ===
                 # 将当前 batch 切分为支持集和查询集
                 # 使用最后一次迭代的 batch 数据进行元学习
-                if len(batch_users) > 1:  # 确保有足够的数据进行切分
+                if len(batch_users) > 2:  # 确保有足够的数据进行切分（至少2条数据）
                     half = len(batch_users) // 2
                     support_data = (batch_users[:half], batch_items[:half], batch_ratings[:half])
                     query_data = (batch_users[half:], batch_items[half:], batch_ratings[half:])
