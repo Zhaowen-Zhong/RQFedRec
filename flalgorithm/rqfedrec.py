@@ -187,21 +187,26 @@ class RQFedRec(object):
                         loss.backward()
                         self.student_optimizer[i].step()
                 
-                # 此处需在model中实现对比学习、双层公平调节、以及元学习内循环
-                # 1. 对比学习与公平调节
-                # cl_loss = self.client_model[i].contrastive_loss(...)
-                # fair_loss = self.client_model[i].fairness_regularization(...)
-                # (cl_loss + fair_loss).backward()
-                # self.student_optimizer[i].step()
-
-                # 2. 元学习内循环（支持集适应 -> 查询集评估 -> 元梯度）
-                # 注意：码序列是整数，需要先放宽为概率分布，再求导
+                # FedCodeFair组件调用
+                # 1. 对比学习（需要从 loader 里准备两个视图，这里先用伪代码占位）
+                # cl_loss = self.client_model[i].contrastive_loss(view1_user_emb, view2_user_emb)
+                
+                # 2. 公平正则（从当前 batch 取 sid 计算）
+                # fair_loss = self.client_model[i].fairness_regularization(batch_sid)
+                
+                # 3. 元学习内循环（骨架）
                 # meta_loss = self.client_model[i].meta_adapt(support_data, query_data, steps=self.meta_steps, lr=self.meta_lr)
+                
+                # 4. 组合额外损失并反向传播更新 Student（注意权重调节，比如 0.1 和 0.01）
+                # extra_loss = cl_loss + 0.1 * fair_loss + 0.01 * meta_loss
+                # self.student_optimizer[i].zero_grad()
+                # extra_loss.backward()
+                # self.student_optimizer[i].step()
             
             self.client_model[i] = self.client_model[i].to('cpu')
 
-        # 客户端上传，融合码序列和鲁棒聚合
-        def client_upload(self):
+    # 客户端上传，融合码序列和鲁棒聚合
+    def client_upload(self):
         self.client_sids = [] 
         
         # 1. 收集所有客户端的参数和码序列
@@ -298,6 +303,9 @@ class RQFedRec(object):
             # 新增加，获取双通道邻居并注入本地图
             sem_neigh = self.semantic_neighbors[i] if i < len(self.semantic_neighbors) else []
             beh_neigh = self.behavior_neighbors[i] if i < len(self.behavior_neighbors) else []
+            
+            # 将客户端索引 i 作为 user_id 传入，执行双通道邻居聚合，并存入模型的 neighbor_bias 字典中
+            self.client_model[i].inject_neighbors(i, sem_neigh, beh_neigh)
             
             self.client_model[i].teacher_update()
             self.client_model[i] = self.client_model[i].to('cpu')
