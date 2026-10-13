@@ -195,7 +195,7 @@ class RQFedRec(object):
                 # self.student_optimizer[i].step()
 
                 # 2. 元学习内循环（支持集适应 -> 查询集评估 -> 元梯度）
-                # 注意：码序列是整数，需要先放宽为概率分布（Gumbel-Softmax），再求导
+                # 注意：码序列是整数，需要先放宽为概率分布，再求导
                 # meta_loss = self.client_model[i].meta_adapt(support_data, query_data, steps=self.meta_steps, lr=self.meta_lr)
             
             self.client_model[i] = self.client_model[i].to('cpu')
