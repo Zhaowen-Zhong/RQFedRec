@@ -51,13 +51,13 @@ class RQFedRec(object):
 
         from k_means_constrained import KMeansConstrained
 
-        clf = KMeansConstrained(n_clusters=self.cluster_num, size_min=size_min, size_max=size_max, max_iter=10, n_init=10, n_jobs=10, verbose=False, random_state=42)
+        clf = KMeansConstrained(n_clusters=self.cluster_num, size_min=size_min, size_max=size_max, max_iter=10, n_init=10, n_jobs=1, verbose=False, random_state=42)
         clf.fit(residual)
         return clf.labels_, clf.cluster_centers_
 
     def generate_codebook(self, dataset_dict):
         dataset_path = dataset_dict['path'] + f'_{self.client_num}/'
-        residual = np.load(dataset_path + 'item_embeddings.npy')
+        residual = np.load(dataset_path + 'item_embeddings.npy').copy()
 
         if self.initial_sid == "random":
             rng = np.random.default_rng(42)
