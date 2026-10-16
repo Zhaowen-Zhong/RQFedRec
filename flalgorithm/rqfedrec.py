@@ -106,6 +106,19 @@ class RQFedRec(object):
         实现目标：防御投毒攻击。0.1表示去掉参数分布中最大10%和最小10%的值,剩下求平均。
         """
         self.trim_ratio = config.getfloat("train", "trim_ratio", fallback=0.1)
+
+        # ==================== 消融实验开关 ====================
+        # 读取配置文件中的开关（默认全开）
+        self.use_meta = config.getboolean("train", "use_meta", fallback=True)
+        self.use_graph = config.getboolean("train", "use_graph", fallback=True)
+        self.use_privacy = config.getboolean("train", "use_privacy", fallback=True)
+        self.use_trim = config.getboolean("train", "use_trim", fallback=True)
+        self.use_cl = config.getboolean("train", "use_cl", fallback=True)
+        self.use_fair = config.getboolean("train", "use_fair", fallback=True)
+        
+        self.logger.info(f"消融开关设置: Meta={self.use_meta}, Graph={self.use_graph}, "
+                         f"Privacy={self.use_privacy}, Trim={self.use_trim}, "
+                         f"CL={self.use_cl}, Fair={self.use_fair}")
         
         self.client_model = []
         self.teacher_optimizer = []
@@ -165,7 +178,6 @@ class RQFedRec(object):
             self.client_model[i] = self.client_model[i].to(self.device)
             self.client_model[i].train()
             
-            # 原有逻辑：基础teacher/student训练
             for _ in range(self.update_frequence):
                 # 1. teacher模型训练
                 for _ in range(self.teacher_epoch):
@@ -176,24 +188,26 @@ class RQFedRec(object):
                         # === 基础推荐损失 ===
                         loss = self.client_model[i].teacher_loss(batch_users, batch_items, batch_ratings)
                         
-                        # === FedCodeFair组件：公平正则 (表示层) ===
-                        # 获取当前 batch 的离散码序列，计算码分布的熵
-                        batch_sid = self.client_model[i].sid[batch_items]
-                        fair_loss = self.client_model[i].fairness_regularization(batch_sid)
-                        
-                        # === FedCodeFair组件：对比学习 ===
-                        # 视图1：原始用户嵌入
-                        view1_user_emb = self.client_model[i].embedding_user(batch_users)
-                        # 视图2：用户嵌入 + 双通道邻居偏置（如果存在）
-                        if i in self.client_model[i].neighbor_bias:
-                            bias = self.client_model[i].neighbor_bias[i]
-                            view2_user_emb = view1_user_emb + bias
+                        # === 消融开关：公平正则 ===
+                        if self.use_fair:
+                            batch_sid = self.client_model[i].sid[batch_items]
+                            fair_loss = self.client_model[i].fairness_regularization(batch_sid)
                         else:
-                            view2_user_emb = view1_user_emb
-                        cl_loss = self.client_model[i].contrastive_loss(view1_user_emb, view2_user_emb)
+                            fair_loss = torch.tensor(0.0, device=self.device)
                         
-                        # === 组合损失并更新 Teacher ===
-                        # 权重 (0.1, 0.01) 是经验值，后期需要根据实验效果调参
+                        # === 消融开关：对比学习 ===
+                        if self.use_cl:
+                            view1_user_emb = self.client_model[i].embedding_user(batch_users)
+                            if i in self.client_model[i].neighbor_bias:
+                                bias = self.client_model[i].neighbor_bias[i]
+                                view2_user_emb = view1_user_emb + bias
+                            else:
+                                view2_user_emb = view1_user_emb
+                            cl_loss = self.client_model[i].contrastive_loss(view1_user_emb, view2_user_emb)
+                        else:
+                            cl_loss = torch.tensor(0.0, device=self.device)
+                        
+                        # 组合损失
                         total_loss = loss + 0.1 * fair_loss + 0.01 * cl_loss
                         
                         self.teacher_optimizer[i].zero_grad()
@@ -210,22 +224,18 @@ class RQFedRec(object):
                         loss.backward()
                         self.student_optimizer[i].step()
                 
-                # === FedCodeFair组件：元学习内循环 ===
-                # 将当前 batch 切分为支持集和查询集
-                # 使用最后一次迭代的 batch 数据进行元学习
-                if len(batch_users) > 2:  # 确保有足够的数据进行切分（至少2条数据）
+                # === 消融开关：元学习内循环 ===
+                if self.use_meta and len(batch_users) > 2:
                     half = len(batch_users) // 2
                     support_data = (batch_users[:half], batch_items[:half], batch_ratings[:half])
                     query_data = (batch_users[half:], batch_items[half:], batch_ratings[half:])
                     
-                    # 调用模型内部的元学习适应函数
                     meta_loss = self.client_model[i].meta_adapt(
                         support_data, query_data, 
                         steps=self.meta_steps, 
                         lr=self.meta_lr
                     )
                     
-                    # 反向传播元损失，更新模型参数（包括全局码本）
                     self.student_optimizer[i].zero_grad()
                     meta_loss.backward()
                     self.student_optimizer[i].step()
@@ -235,52 +245,41 @@ class RQFedRec(object):
     # 客户端上传，融合码序列和鲁棒聚合
     def client_upload(self):
         self.client_sids = [] 
-        
-        # 1. 收集所有客户端的参数和码序列
-        # 格式：{参数名: [张量1, 张量2, ...], ...}
         collected_params = {k: [] for k in self.server_paramname}
         
         for i in range(self.client_num):
             self.client_model[i] = self.client_model[i].to(self.device)
-            
-            # 收集码序列，并应用 H_u 隐私级数截断
             local_sid = self.client_model[i].sid.detach().cpu().numpy()
             H_u = self.H_u_list[i]
             truncated_sid = local_sid[:, :H_u] 
             self.client_sids.append(truncated_sid)
             
-            # 收集参数
             state_dict = self.client_model[i].state_dict()
             for k in self.server_paramname:
-                collected_params[k].append(state_dict[k].cpu()) # 放在 CPU 上排序，节省显存
-                
+                collected_params[k].append(state_dict[k].cpu())
             self.client_model[i] = self.client_model[i].to("cpu")
 
-        # 2. 执行 Trimmed-Mean 聚合
+        # 消融开关：Trimmed-Mean 聚合
         aggstate = {}
         for k in self.server_paramname:
-            # 堆叠所有客户端的该参数，形状：(client_num, *param_shape)
             stacked = torch.stack(collected_params[k], dim=0) 
             
-            # 在 client_num 维度上进行排序
-            sorted_tensors, _ = torch.sort(stacked, dim=0)
-            
-            # 计算需要裁剪的数量
-            n = len(collected_params[k])
-            trim_count = int(n * self.trim_ratio)
-            
-            # 裁剪最大和最小的部分
-            if trim_count > 0:
-                trimmed = sorted_tensors[trim_count : n - trim_count]
+            if self.use_trim:
+                sorted_tensors, _ = torch.sort(stacked, dim=0)
+                n = len(collected_params[k])
+                trim_count = int(n * self.trim_ratio)
+                if trim_count > 0:
+                    trimmed = sorted_tensors[trim_count : n - trim_count]
+                else:
+                    trimmed = sorted_tensors
+                aggstate[k] = trimmed.mean(dim=0).to(self.device)
+                self.logger.info(f"Trimmed-Mean 聚合完成，裁剪比例: {self.trim_ratio}")
             else:
-                trimmed = sorted_tensors
-                
-            # 对剩余部分求平均
-            aggstate[k] = trimmed.mean(dim=0).to(self.device)
+                # 退化为标准 FedAvg
+                aggstate[k] = stacked.mean(dim=0).to(self.device)
+                self.logger.info("标准 FedAvg 聚合完成（未启用 Trimmed-Mean）")
 
-        # 3. 将聚合后的参数加载回服务端模型
         self.server_model.load_state_dict(aggstate, strict=False)
-        self.logger.info(f"Trimmed-Mean 聚合完成，裁剪比例: {self.trim_ratio}")
 
     # 新增码共现图
     def build_code_cooccurrence_graph(self):
@@ -415,27 +414,26 @@ class RQFedRec(object):
                 self.client_init()
                 self.logger.info(f"Finish init client model in {(time.time() - start_time):.2f}s")
 
-            # 1. 客户端本地训练，包含元学习、CL、公平调节
             self.train_client_model()
             self.logger.info(f"Finish client train in {(time.time() - start_time):.2f}s")
 
-            # 2. 客户端上传，包含H_u隐私截断，码序列上传、鲁棒聚合
             self.client_upload()
             self.logger.info(f"Finish upload in {(time.time() - start_time):.2f}s")
 
-            # 3. 服务器动态更新全局码本
             if epoch_i > 0:
                 self.update_data()
 
-            # 4. 新增加，服务端构建码共现图，寻找语义邻居
-            self.build_code_cooccurrence_graph()
-            self.logger.info(f"Finish Graph construction in {(time.time() - start_time):.2f}s")
+            # 消融开关：码共现图
+            if self.use_graph:
+                self.build_code_cooccurrence_graph()
+                self.logger.info(f"Finish Graph construction in {(time.time() - start_time):.2f}s")
+            else:
+                self.semantic_neighbors = [] # 清空邻居，防止注入
+                self.logger.info("Skipping Graph construction (use_graph=False)")
 
-            # 5. 客户端下载，全局码本和行为/语义双通道邻居注入
             self.client_download()
             self.logger.info(f"Finish download in {(time.time() - start_time):.2f}s")
 
-            # 6. 验证集评估
             valid_metric = self.evaluate_valid()
             self.logger.info(f"Finish valid valid set epoch {epoch_i} in {(time.time() - start_time):.2f}s, recall: {valid_metric[1]}, mrr: {valid_metric[3]}, ndcg: {valid_metric[4]}.")
 
