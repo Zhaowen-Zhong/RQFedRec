@@ -89,6 +89,10 @@ class RQFedRec(BasicModel):
             此处采用邻居嵌入平均聚合，并将聚合后的邻居信息
             作为偏置，注入到对应用户的表示中。后续可替换为 GAT 或 LightGCN 多层传播。
         """
+        # 【关键修复：安全过滤】过滤掉超出用户嵌入表范围的邻居索引，防止 CUDA device-side assert 报错
+        sem_neigh = [u for u in sem_neigh if u < self.num_users]
+        beh_neigh = [u for u in beh_neigh if u < self.num_users]
+
         # 1. 处理语义邻居 (Semantic Neighbors)
         if len(sem_neigh) > 0:
             sem_tensor = torch.tensor(sem_neigh, device=self.device, dtype=torch.long)
@@ -163,24 +167,22 @@ class RQFedRec(BasicModel):
         s_users, s_items, s_ratings = support_data
         q_users, q_items, q_ratings = query_data
         
+        # 【关键修复：新增辅助函数】
+        # 使用 F.embedding 直接操作权重张量，避免 .data 赋值切断计算图（防止 RuntimeError: differentiated tensors not used）
+        def get_emb_with_weights(items, weights):
+            item_emb = torch.sum(torch.stack([F.embedding(self.sid[items, _], weights[_]) for _ in range(self.sid_length)]), dim=0)
+            return item_emb
+
         # 2. 支持集适应（Support Set Adaptation）
         for _ in range(steps):
             # 使用快速权重计算支持集的前向传播
             # 为了简化，这里直接使用支持集的推荐损失（实际可加入 Gumbel-Softmax 松弛）
             s_users_emb = self.embedding_user(s_users)
             
-            # 临时替换码本权重以计算快速适应损失
-            original_weights = [c.weight.data.clone() for c in self.codebook_embeddings]
-            for c, w in zip(self.codebook_embeddings, fast_weights):
-                c.weight.data = w
-                
-            s_items_emb = self.get_item_emb(s_items)
+            # 【关键修复】替换原来的 `.data` 赋值逻辑，改用辅助函数计算，保持计算图连通
+            s_items_emb = get_emb_with_weights(s_items, fast_weights)
             scores = self.f(torch.sum(torch.mul(s_users_emb, s_items_emb), dim=1))
             loss = self.BCEloss(scores, s_ratings)
-            
-            # 还原原始权重，防止影响外循环
-            for c, w in zip(self.codebook_embeddings, original_weights):
-                c.weight.data = w
                 
             # 求梯度并更新快速权重
             grads = torch.autograd.grad(loss, fast_weights, create_graph=True)
@@ -188,18 +190,12 @@ class RQFedRec(BasicModel):
             
         # 3. 查询集评估（Query Set Evaluation）
         # 使用适应后的 fast_weights，在查询集上计算 meta_loss
-        original_weights = [c.weight.data.clone() for c in self.codebook_embeddings]
-        for c, w in zip(self.codebook_embeddings, fast_weights):
-            c.weight.data = w
-            
         q_users_emb = self.embedding_user(q_users)
-        q_items_emb = self.get_item_emb(q_items)
+        
+        # 【关键修复】同样使用辅助函数
+        q_items_emb = get_emb_with_weights(q_items, fast_weights)
         q_scores = self.f(torch.sum(torch.mul(q_users_emb, q_items_emb), dim=1))
         meta_loss = self.BCEloss(q_scores, q_ratings)
         
-        # 还原原始权重
-        for c, w in zip(self.codebook_embeddings, original_weights):
-            c.weight.data = w
-            
         # 返回 meta_loss，让外部的 student_optimizer 去更新全局码本
         return meta_loss
